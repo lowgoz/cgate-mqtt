@@ -37,6 +37,7 @@ var isRamping = false;
 
 
 var discoverySent = [];
+var triggerActions = [];
 var HASS_DEVICE_CLASSES = {
   LIGHT: "light",
   RELAY: "switch",
@@ -101,8 +102,6 @@ var mqttMessage = {
       mqttClient.publish(msg.topic, msg.payload, { retain: true }, (err) => {
         if (err) {
           console.error('Failed to publish message:', err);
-        } else {
-          console.log('Message published with retain flag set to true');
         }
       });
     }
@@ -133,7 +132,7 @@ mqttClient.on('connect', () => {
       return;
     }
     mqttClient.on('message', (topicArg, message, packet) => {
-      handleMessage(topicArg, message);
+      handleMqttMessage(topicArg, message);
     });
   });
   mqttClient.publish('cbus/bridge/cbus2-mqtt/state', 'online', options, (err) => {
@@ -258,8 +257,10 @@ function started() {
     readXmlFile('HOME.xml');
 
     if (settings.getallnetapp && settings.getallonstart) {
+      // setTimeout(() => {
       console.log('Getting all values');
       cgateCommand.write('GET //' + settings.cbusname + '/' + settings.getallnetapp + '/* level\n');
+      // }, 60000); // wait for 60 seconds before executing the command
     }
     if (settings.getallnetapp && settings.getallperiod) {
       clearInterval(interval);
@@ -273,7 +274,7 @@ function started() {
 }
 
 
-function handleMessage(topicArg, message) {
+function handleMqttMessage(topicArg, message) {
   if (logging === true) {
     console.log(`Message received on ${topicArg}: ${message}`);
   }
@@ -301,8 +302,11 @@ function handleMessage(topicArg, message) {
           }
       }
       break;
-    case "transition":
-      console.log(`[${parts[4].toLowerCase()}] message for ${cbusAddress} received: ${message}`);
+    case "state":
+      // ignoring state messages
+      break;
+    case "attributes":
+      // ignoring attribute messages
       break;
     default:
       console.log(`Ignoring [${parts[parts.length - 1].toLowerCase()}] "${message}" message for ${topic}`);
@@ -312,16 +316,17 @@ function handleMessage(topicArg, message) {
 
 
 function handleTriggerEvent(parts, uniqueId) {
-  if (settings.enableHassDiscovery) {
-    sendDiscoveryMessage(HASS_DEVICE_CLASSES.BUTTON, parts[2], parts[3], parts[4]);
-  }
   if (logging === true) {
     console.log(`C-Bus trigger received: ${uniqueId}`);
   }
+
+  const sourceunit = parts[4].split('&').find(param => param.startsWith('#sourceunit='));
   const payload = {
-    event_type: "hold"
+    event_type: triggerActions[parseInt(parts[3], 10)].tagName,
+    trigger_unit: sourceunit ? sourceunit.split('=')[1] : 'unknown'
   };
-  mqttMessage.publish(`cbus/sensor/cbus2-mqtt/${uniqueId}/state`, JSON.stringify(payload), options, function () { });
+
+  mqttMessage.publish(`cbus/event/cbus2-mqtt/${uniqueId}/state`, JSON.stringify(payload), options, function () { });
 }
 
 function handleLightingEvent(parts, uniqueId) {
@@ -348,17 +353,17 @@ function handleLightingEvent(parts, uniqueId) {
 
 
 function handleLightData(parts) {
-  const address = parts[0].split("/");
-  const uniqueId = `cbus_${address[3]}_${address[4]}_${address[5]}`;
+  const address = parts[0].slice(2).split('/').slice(1, 4).map(str => str.replace(':', ''));
+  const uniqueId = `cbus_${address[0]}_${address[1]}_${address[2]}`;
   const level = parseInt(parts[1].split("=")[1]);
 
   if (level === 0) {
     // Light is 'Off'
-    eventEmitter.emit('level', address.slice(3).join('/'), 0);
+    eventEmitter.emit('level', address.join('/'), 0);
     mqttMessage.publish(`cbus/light/cbus2-mqtt/${uniqueId}/state`, "OFF", options, function () { });
   } else {
     // Light is 'On' (Dimmer) 
-    eventEmitter.emit('level', address.slice(3).join('/'), Math.round(level));
+    eventEmitter.emit('level', address.join('/'), Math.round(level));
     mqttMessage.publish(`cbus/light/cbus2-mqtt/${uniqueId}/brightness`, Math.round(level * 100 / 255).toString(), options, function () { });
     mqttMessage.publish(`cbus/light/cbus2-mqtt/${uniqueId}/state`, "ON", options, function () { });
   }
@@ -378,8 +383,15 @@ function handleParsedTree(result) {
   tree = '';
 }
 
-function sendDiscoveryMessage(deviceClass, networkId, serviceId, groupId, tagName, outputChannel, unitName, unitAddress, outputType, unitCatalogNumber) {
-  const uniqueId = `cbus_${networkId}_${serviceId}_${groupId}`;
+function getTagNamesByTriggerAddress(triggerActions, triggerAddress) {
+  const filteredActions = triggerActions.filter(action => action.triggerAddress === triggerAddress);
+  const tagNames = filteredActions.map(action => action.tagName);
+  return tagNames;
+}
+
+
+function sendDiscoveryMessage(deviceClass, networkId, serviceId, groupId, tagName, outputChannel, unitName, unitAddress, outputType, unitCatalogNumber, eventTypes) {
+  const uniqueId = deviceClass === 'device' ? `cbus_${settings.cbusname}` : `cbus_${networkId}_${serviceId}_${groupId}`;
   if (discoverySent.includes(uniqueId)) {
     return;
   }
@@ -388,13 +400,13 @@ function sendDiscoveryMessage(deviceClass, networkId, serviceId, groupId, tagNam
   }
   const mqttTopicPrefix = 'homeassistant';
   const mqttTopicSuffix = 'cbus2-mqtt';
-  const mqttTopic = `${mqttTopicPrefix}/${deviceClass}/${mqttTopicSuffix}/${uniqueId}/config`;
+  var mqttTopic = `${mqttTopicPrefix}/${deviceClass}/${mqttTopicSuffix}/${uniqueId}/config`;
   const device = {
     identifiers: [`cbus2-mqtt`],
-    name: 'CBus',
+    name: 'C-Bus ',
     manufacturer: 'DamianFlynn.com',
     model: 'C-Bus C-Gate MQTT Bridge',
-    sw_version: '0.3',
+    sw_version: '0.5',
     via_device: `cbus2-mqtt`
   };
   let payload = {};
@@ -440,22 +452,19 @@ function sendDiscoveryMessage(deviceClass, networkId, serviceId, groupId, tagNam
       break;
     case "button":
       payload = {
-        name: `${uniqueId}`,
+        name: `${tagName}`,
         unique_id: `${uniqueId}`,
-        availability_topic: "cbus/PLC/House/availability",
+        object_id: `${uniqueId}`,
+        availability_topic: "cbus/bridge/cbus2-mqtt/state",
         payload_available: "online",
         payload_not_available: "offline",
         device,
         device_class: "button",
-        event_types: [
-          "SINGLE",
-          "DOUBLE",
-          "LONG"
-        ],
-        state_topic: `cbus/read/${networkId}/${serviceId}/${groupId}/state`,
-        icon: "mdi:gesture-double-tap",
-        qos: 2
+        event_types: eventTypes || ["SINGLE", "DOUBLE", "LONG"], // use default value if eventTypes is null
+        state_topic: `cbus/event/${mqttTopicSuffix}/${uniqueId}/state`,
+        icon: eventTypes ? "mdi:gesture-double-tap" : "mdi:gesture-tap"
       };
+      mqttTopic = `${mqttTopicPrefix}/event/${mqttTopicSuffix}/${uniqueId}/config`;
       break;
     default:
       return;
@@ -519,16 +528,45 @@ function readXmlFile(filePath) {
         const groupElement = groupElements[groupAddress];
         if (groupElement) {
           groupElement.tagName = group.TagName[0];
-          console.log(`TagName: Pack (${groupElement.unitAddress}) ${groupElement.unitName} [${groupElement.output}], Type: ${groupElement.isDimmer ? 'Dimmer' : 'Relay'} -> ${group.TagName[0]}`);
+          console.log(`Group Tag [${group.TagName[0]}] -> ${groupElement.isDimmer ? 'Dimmer' : 'Relay'} pack (${groupElement.unitAddress}) ${groupElement.unitName} [${groupElement.output}]`);
           if (settings.enableHassDiscovery) {
             // Now Publish the MQTT Discovery Messages
             sendDiscoveryMessage(HASS_DEVICE_CLASSES.LIGHT, '254', "56", groupAddress, group.TagName[0], groupElement.output, groupElement.unitName, groupElement.unitAddress, groupElement.isDimmer ? 'Dimmer' : 'Relay', groupElement.unitCatalogNumber);
           }
         } else {
-          console.log(`!!! Group [${groupAddress}] tagged as '${group.TagName[0]}'  was not found in list of Group Elements`);
+          // Phantom Groups are not linked to a Unit
+          console.log(`Group Tag [${group.TagName[0]}] -> 'Relay' pack (Phantom]`);
+          sendDiscoveryMessage(HASS_DEVICE_CLASSES.LIGHT, '254', "56", groupAddress, group.TagName[0], "Phantom", "Phantom", "Phantom", 'Relay', "Phantom");
         }
       });
 
+      const triggerGroups = result.Installation.Project[0].Network[0].Application.find(app => app.Address[0] === '202').Group;
+      if (triggerGroups) {
+        triggerGroups.forEach(trigger => {
+          const triggerAddress = parseInt(trigger.Address[0], 10);
+          const triggerTagName = trigger.TagName[0];
+          if (trigger.Level) {
+            trigger.Level.forEach(level => {
+              const levelAddress = parseInt(level.Address[0], 10);
+              triggerActions[levelAddress] = {
+                tagName: level.TagName[0],
+                triggerName: triggerTagName,
+                triggerAddress: triggerAddress
+              };
+            });
+            
+            const tagNames = getTagNamesByTriggerAddress(triggerActions, triggerAddress).map(tagName => `${tagName}`);
+
+            console.log(`Trigger (${triggerAddress}) ${triggerTagName} has ${tagNames.length} levels ${JSON.stringify(tagNames)}`);
+            sendDiscoveryMessage(HASS_DEVICE_CLASSES.BUTTON, '254', "202", triggerAddress, triggerTagName,null ,null,null ,null ,null, tagNames );
+          } else {
+            console.log(`Trigger (${triggerAddress}) ${triggerTagName} does not have any levels`);
+          }
+        });
+      } else {
+        console.log('triggerGroups is undefined');
+      }
+      
       if (logging == true) { console.log(`Group Elements: ${JSON.stringify(groupElements)}`) };
     });
   });
