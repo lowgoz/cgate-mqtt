@@ -13,7 +13,7 @@ exports.topicPrefix = "homeassistant"
 exports.enableHassDiscovery = true;
 //username and password (unncomment to use)
 exports.mqttusername = 'cbus';
-exports.mqttpassword = 'Password!';
+exports.mqttpassword = 'P@ssw0rd!';
 
 // net and app for automatically requesting values
 exports.getallnetapp = '254/56';
